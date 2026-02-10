@@ -275,9 +275,11 @@ def build_pipeline(args):
     else:
         raise ValueError(f"Unknown video source: {args.video_source}")
 
+    rtp_mtu_prop = f' mtu={args.rtp_mtu}' if args.rtp_mtu else ''
+
     if args.video_codec == 'vp8':
         video_enc = f'vp8enc deadline=1 keyframe-max-dist={args.keyframe_interval}'
-        video_pay = 'rtpvp8pay pt=97 picture-id-mode=1'
+        video_pay = f'rtpvp8pay pt=97 picture-id-mode=1{rtp_mtu_prop}'
         video_rtp_caps = (
             'capsfilter caps=application/x-rtp,media=video,encoding-name=VP8,payload=97,clock-rate=90000'
         )
@@ -294,7 +296,7 @@ def build_pipeline(args):
         video_pay = (
             'h264parse config-interval=1 ! '
             'capsfilter caps=video/x-h264,stream-format=avc,alignment=au ! '
-            'rtph264pay pt=97 config-interval=1'
+            f'rtph264pay pt=97 config-interval=1{rtp_mtu_prop}'
         )
         video_rtp_caps = (
             'capsfilter caps=application/x-rtp,media=video,encoding-name=H264,payload=97,clock-rate=90000,'
@@ -367,8 +369,10 @@ if __name__=='__main__':
     parser.add_argument('--height', type=int, default=0, help='Video height (libcamera only)')
     parser.add_argument('--framerate', type=int, default=0, help='Video framerate (libcamera only)')
     parser.add_argument('--bitrate', type=int, default=0, help='Encoder bitrate (kbps, if supported)')
-    parser.add_argument('--keyframe-interval', type=int, default=30,
+    parser.add_argument('--keyframe-interval', '--key-int', dest='keyframe_interval', type=int, default=30,
                         help='Keyframe interval for VP8 (default: 30)')
+    parser.add_argument('--rtp-mtu', type=int, default=0,
+                        help='RTP MTU size (optional)')
     parser.add_argument('--no-audio', action='store_true', help='Disable audio')
     parser.add_argument('--preview', action='store_true', help='Show local preview on Pi')
     args = parser.parse_args()
