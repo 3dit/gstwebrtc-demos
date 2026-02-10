@@ -24,6 +24,11 @@ var send_channel;
 var ws_conn;
 // Promise for local stream after constraints are approved by the user
 var local_stream_promise;
+// Buffer ICE until remote description is set
+var pending_remote_ice = [];
+var remote_description_set = false;
+var recv_only = false;
+var stats_interval;
 
 function getOurId() {
     return Math.floor(Math.random() * (9000 - 10) + 10).toString();
@@ -78,11 +83,23 @@ function resetVideo() {
 function onIncomingSDP(sdp) {
     peer_connection.setRemoteDescription(sdp).then(() => {
         setStatus("Remote SDP set");
+        remote_description_set = true;
+        if (pending_remote_ice.length) {
+            pending_remote_ice.forEach((ice) => {
+                var candidate = new RTCIceCandidate(ice);
+                peer_connection.addIceCandidate(candidate).catch(setError);
+            });
+            pending_remote_ice = [];
+        }
         if (sdp.type != "offer")
             return;
         setStatus("Got SDP offer");
         local_stream_promise.then((stream) => {
-            setStatus("Got local stream, creating answer");
+            if (stream) {
+                setStatus("Got local stream, creating answer");
+            } else {
+                setStatus("No local stream, creating recv-only answer");
+            }
             peer_connection.createAnswer()
             .then(onLocalDescription).catch(setError);
         }).catch(setError);
@@ -105,6 +122,10 @@ function generateOffer() {
 
 // ICE candidate received from peer, add it to the peer connection
 function onIncomingICE(ice) {
+    if (!remote_description_set) {
+        pending_remote_ice.push(ice);
+        return;
+    }
     var candidate = new RTCIceCandidate(ice);
     peer_connection.addIceCandidate(candidate).catch(setError);
 }
@@ -156,10 +177,17 @@ function onServerMessage(event) {
 function onServerClose(event) {
     setStatus('Disconnected from server');
     resetVideo();
+    pending_remote_ice = [];
+    remote_description_set = false;
 
     if (peer_connection) {
         peer_connection.close();
         peer_connection = null;
+    }
+
+    if (stats_interval) {
+        clearInterval(stats_interval);
+        stats_interval = null;
     }
 
     // Reset after a second
@@ -184,12 +212,19 @@ function getLocalStream() {
     }
     console.log(JSON.stringify(constraints));
 
-    // Add local stream
-    if (navigator.mediaDevices.getUserMedia) {
-        return navigator.mediaDevices.getUserMedia(constraints);
-    } else {
-        errorUserMediaHandler();
+    if (constraints && constraints.audio === false && constraints.video === false) {
+        setStatus("Recv-only: no local media requested");
+        recv_only = true;
+        return Promise.resolve(null);
     }
+    recv_only = false;
+
+    // Add local stream
+    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+        return navigator.mediaDevices.getUserMedia(constraints);
+    }
+    errorUserMediaHandler();
+    return Promise.resolve(null);
 }
 
 function websocketServerConnect() {
@@ -232,9 +267,23 @@ function websocketServerConnect() {
 }
 
 function onRemoteTrack(event) {
+    if (event.track && event.track.kind !== 'video') {
+        return;
+    }
     if (getVideoElement().srcObject !== event.streams[0]) {
         console.log('Incoming stream');
-        getVideoElement().srcObject = event.streams[0];
+        console.log('Track kind:', event.track.kind, 'readyState:', event.track.readyState);
+        console.log('Stream tracks:', event.streams[0].getTracks().map(t => t.kind + ':' + t.readyState));
+        event.track.onmute = () => console.log('Track muted:', event.track.kind);
+        event.track.onunmute = () => console.log('Track unmuted:', event.track.kind);
+        const videoElement = getVideoElement();
+        videoElement.srcObject = event.streams[0];
+        videoElement.muted = true;
+        videoElement.onloadedmetadata = () => {
+            console.log('Video metadata:', videoElement.videoWidth, videoElement.videoHeight);
+            videoElement.play().catch(() => {});
+        };
+        videoElement.play().catch(() => {});
     }
 }
 
@@ -291,10 +340,28 @@ function createCall(msg) {
     send_channel.onclose = handleDataChannelClose;
     peer_connection.ondatachannel = onDataChannel;
     peer_connection.ontrack = onRemoteTrack;
+    if (recv_only) {
+        peer_connection.addTransceiver('video', { direction: 'recvonly' });
+        peer_connection.addTransceiver('audio', { direction: 'recvonly' });
+    }
+    peer_connection.oniceconnectionstatechange = () => {
+        console.log('ICE state:', peer_connection.iceConnectionState);
+        setStatus('ICE: ' + peer_connection.iceConnectionState);
+    };
+    peer_connection.onconnectionstatechange = () => {
+        console.log('Connection state:', peer_connection.connectionState);
+    };
+    peer_connection.onsignalingstatechange = () => {
+        console.log('Signaling state:', peer_connection.signalingState);
+    };
     /* Send our video/audio to the other peer */
     local_stream_promise = getLocalStream().then((stream) => {
-        console.log('Adding local stream');
-        peer_connection.addStream(stream);
+        if (stream) {
+            console.log('Adding local stream');
+            peer_connection.addStream(stream);
+        } else {
+            console.log('No local stream available');
+        }
         return stream;
     }).catch(setError);
 
