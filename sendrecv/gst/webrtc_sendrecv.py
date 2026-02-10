@@ -36,8 +36,15 @@ class WebRTCClient:
 
 
     async def connect(self):
-        sslctx = ssl.create_default_context(purpose=ssl.Purpose.CLIENT_AUTH)
-        self.conn = await websockets.connect(self.server, ssl=sslctx)
+        sslarg = None
+        if self.server.startswith("wss://"):
+            sslctx = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
+            sslctx.check_hostname = False
+            sslctx.verify_mode = ssl.CERT_NONE
+            sslarg = sslctx
+
+        self.conn = await websockets.connect(self.server, ssl=sslarg)
+
         await self.conn.send('HELLO %d' % self.id_)
 
     async def setup_call(self):
@@ -53,8 +60,20 @@ class WebRTCClient:
 
     def on_offer_created(self, promise, _, __):
         promise.wait()
+
+        # reply = promise.get_reply()
+        # offer = reply['offer']
+        # promise.get_reply() returns a Gst.Structure on newer gi/GStreamer builds
         reply = promise.get_reply()
-        offer = reply['offer']
+        offer = None
+        try:
+            offer = reply['offer']  # older bindings
+        except TypeError:
+            offer = reply.get_value('offer')  # newer bindings
+
+        if offer is None:
+            raise RuntimeError("Failed to get 'offer' from promise reply")
+
         promise = Gst.Promise.new()
         self.webrtc.emit('set-local-description', offer, promise)
         promise.interrupt()
@@ -139,7 +158,8 @@ class WebRTCClient:
             self.webrtc.emit('add-ice-candidate', sdpmlineindex, candidate)
 
     def close_pipeline(self):
-        self.pipe.set_state(Gst.State.NULL)
+        if self.pipe:
+            self.pipe.set_state(Gst.State.NULL)
         self.pipe = None
         self.webrtc = None
 

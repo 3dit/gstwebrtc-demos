@@ -216,7 +216,8 @@ function websocketServerConnect() {
     } else {
         throw new Error ("Don't know how to connect to the signalling server with uri" + window.location);
     }
-    var ws_url = 'wss://' + ws_server + ':' + ws_port
+    var ws_url = 'ws://' + ws_server + ':' + ws_port
+    console.log('WS_URL IS ', ws_url);
     setStatus("Connecting to server " + ws_url);
     ws_conn = new WebSocket(ws_url);
     /* When connected, immediately register with the server */
