@@ -352,7 +352,8 @@ if __name__=='__main__':
     if not check_plugins():
         sys.exit(1)
     parser = argparse.ArgumentParser()
-    parser.add_argument('peerid', help='String ID of the peer to connect to')
+    parser.add_argument('peerid', nargs='?', default='browser',
+                        help='String ID of the peer to connect to (default: browser)')
     parser.add_argument('--server', help='Signalling server to connect to, eg "wss://127.0.0.1:8443"')
     parser.add_argument('--video-source', choices=['test', 'libcamera'], default='test',
                         help='Video source to use (default: test)')
