@@ -14,11 +14,16 @@ gi.require_version('GstWebRTC', '1.0')
 from gi.repository import GstWebRTC
 gi.require_version('GstSdp', '1.0')
 from gi.repository import GstSdp
+gi.require_version('GstVideo', '1.0')
+from gi.repository import GstVideo
 
 PIPELINE_DESC = '''
 webrtcbin name=sendrecv bundle-policy=max-bundle stun-server=stun://stun.l.google.com:19302
- videotestsrc is-live=true pattern=ball ! videoconvert ! queue ! vp8enc deadline=1 ! rtpvp8pay !
- queue ! application/x-rtp,media=video,encoding-name=VP8,payload=97 ! sendrecv.
+ videotestsrc is-live=true pattern=ball ! videoconvert ! capsfilter caps=video/x-raw,format=NV12 !
+ queue ! v4l2h264enc extra-controls="encode,repeat_sequence_header=1" !
+ h264parse config-interval=-1 ! capsfilter caps=video/x-h264,profile=baseline,level=3.1,stream-format=byte-stream,alignment=au !
+ rtph264pay pt=97 config-interval=-1 !
+ queue ! application/x-rtp,media=video,encoding-name=H264,payload=97,clock-rate=90000,packetization-mode=1 ! sendrecv.
  audiotestsrc is-live=true wave=red-noise ! audioconvert ! audioresample ! queue ! opusenc ! rtpopuspay !
  queue ! application/x-rtp,media=audio,encoding-name=OPUS,payload=96 ! sendrecv.
 '''
@@ -53,44 +58,11 @@ class WebRTCClient:
 
     def send_sdp_offer(self, offer):
         text = offer.sdp.as_text()
-        text = self._ensure_h264_packetization_mode(text)
         print ('Sending offer:\n%s' % text)
         msg = json.dumps({'sdp': {'type': 'offer', 'sdp': text}})
         loop = asyncio.new_event_loop()
         loop.run_until_complete(self.conn.send(msg))
         loop.close()
-
-    def _ensure_h264_packetization_mode(self, sdp_text):
-        lines = sdp_text.split('\n')
-        has_h264 = any(line.startswith('a=rtpmap:97 H264/90000') for line in lines)
-        if not has_h264:
-            return sdp_text
-
-        new_lines = []
-        fmtp_updated = False
-        for line in lines:
-            if line.startswith('a=fmtp:97'):
-                if line.endswith('\r'):
-                    line = line[:-1]
-                    line = line + ';packetization-mode=1' if 'packetization-mode=' not in line else line
-                    line = line + ';profile-level-id=42e01f' if 'profile-level-id=' not in line else line
-                    line = line + ';level-asymmetry-allowed=1' if 'level-asymmetry-allowed=' not in line else line
-                    line = f'{line}\r'
-                else:
-                    line = line + ';packetization-mode=1' if 'packetization-mode=' not in line else line
-                    line = line + ';profile-level-id=42e01f' if 'profile-level-id=' not in line else line
-                    line = line + ';level-asymmetry-allowed=1' if 'level-asymmetry-allowed=' not in line else line
-                fmtp_updated = True
-            new_lines.append(line)
-
-        if not fmtp_updated:
-            for idx, line in enumerate(new_lines):
-                if line.startswith('a=rtpmap:97 H264/90000'):
-                    insert_line = 'a=fmtp:97 packetization-mode=1;profile-level-id=42e01f;level-asymmetry-allowed=1\r'
-                    new_lines.insert(idx + 1, insert_line)
-                    break
-
-        return '\n'.join(new_lines)
 
     def on_offer_created(self, promise, _, __):
         promise.wait()
@@ -127,10 +99,31 @@ class WebRTCClient:
     def on_connection_state_changed(self, element, _):
         state = element.get_property('connection-state')
         print('Peer connection state:', state.value_nick)
+        # Force a keyframe when the full connection (ICE + DTLS) is ready.
+        # The initial keyframe was sent before DTLS completed and was dropped,
+        # so the browser decoder can never start without a fresh one.
+        if state.value_nick == 'connected':
+            print('DTLS connected — forcing keyframe...')
+            event = GstVideo.video_event_new_upstream_force_key_unit(
+                Gst.CLOCK_TIME_NONE, True, 0)
+            if self.pipe.send_event(event):
+                print('Force-key-unit event sent successfully')
+            else:
+                print('Warning: Force-key-unit event failed')
 
     def on_signaling_state_changed(self, element, _):
         state = element.get_property('signaling-state')
         print('Signaling state:', state.value_nick)
+
+    def _on_deep_element_added(self, _, __, element):
+        """Called when an element is added deep inside webrtcbin's sub-bins."""
+        factory = element.get_factory()
+        if factory and factory.get_name() == 'rtpsession':
+            try:
+                element.set_property('rtcp-sync-send-time', False)
+                print(f'Set rtcp-sync-send-time=false on {element.get_name()}')
+            except Exception as e:
+                print(f'Warning: could not set rtcp-sync-send-time: {e}')
 
     def on_bus_error(self, _, msg):
         err, debug = msg.parse_error()
@@ -203,6 +196,26 @@ class WebRTCClient:
         self.webrtc.connect('notify::ice-connection-state', self.on_ice_state_changed)
         self.webrtc.connect('notify::connection-state', self.on_connection_state_changed)
         self.webrtc.connect('notify::signaling-state', self.on_signaling_state_changed)
+        # Catch internal elements as they are added to webrtcbin's sub-bins
+        # so we can set rtcp-sync-send-time=false on rtpsession (avoids the
+        # "running time not set" SR error caused by TransportSendBin dropping
+        # the pipeline latency event).
+        self.webrtc.connect('deep-element-added', self._on_deep_element_added)
+        # Set codec preferences on the video transceiver so the SDP offer
+        # does not contain a fixed profile-level-id that conflicts with the
+        # actual encoder output.
+        try:
+            trans = self.webrtc.emit('get-transceiver', 0)
+            if trans:
+                caps = Gst.caps_from_string(
+                    'application/x-rtp,media=video,encoding-name=H264,payload=97,'
+                    'clock-rate=90000,packetization-mode=(string)1,'
+                    'profile-level-id=(string)42c015,level-asymmetry-allowed=(string)1'
+                )
+                trans.set_property('codec-preferences', caps)
+                print('Set H264 codec-preferences (constrained-baseline, packetization-mode=1)')
+        except Exception as e:
+            print(f'Warning: could not set codec-preferences: {e}')
         bus = self.pipe.get_bus()
         bus.add_signal_watch()
         bus.connect('message::error', self.on_bus_error)
@@ -261,6 +274,10 @@ class WebRTCClient:
 
 def build_pipeline(args):
     video_queue = 'queue max-size-time=0 max-size-buffers=1 max-size-bytes=0 leaky=downstream'
+    # The RTP queue before webrtcbin must hold all RTP packets for a whole
+    # frame (at 800 kbps, ~7 packets).  max-size-buffers=1 causes the leaky
+    # queue to drop most of them, breaking the stream for the browser.
+    rtp_queue = 'queue max-size-time=200000000 max-size-buffers=60 max-size-bytes=0 leaky=downstream'
     audio_queue = 'queue max-size-time=0 max-size-buffers=2 max-size-bytes=0 leaky=downstream'
 
     if args.video_source == 'test':
@@ -269,9 +286,12 @@ def build_pipeline(args):
     elif args.video_source == 'libcamera':
         video_src = 'libcamerasrc'
         if args.width and args.height and args.framerate:
-            video_caps = f'video/x-raw,width={args.width},height={args.height},framerate={args.framerate}/1'
+            video_caps = (
+                f'video/x-raw,format=NV12,width={args.width},height={args.height},'
+                f'framerate={args.framerate}/1'
+            )
         else:
-            video_caps = 'video/x-raw'
+            video_caps = 'video/x-raw,format=NV12'
     else:
         raise ValueError(f"Unknown video source: {args.video_source}")
 
@@ -284,40 +304,65 @@ def build_pipeline(args):
             'capsfilter caps=application/x-rtp,media=video,encoding-name=VP8,payload=97,clock-rate=90000'
         )
     elif args.video_codec == 'h264':
+        is_v4l2 = args.h264_encoder.startswith('v4l2h264enc')
         enc_props = ''
         if args.bitrate:
-            if args.h264_encoder.startswith('v4l2h264enc') and not args.encoder_props:
-                enc_props = f' extra-controls="controls,video_bitrate={args.bitrate * 1000}"'
+            if is_v4l2 and not args.encoder_props:
+                enc_props = (
+                    f' extra-controls="encode,repeat_sequence_header=1,video_bitrate={args.bitrate * 1000}"'
+                )
             else:
                 enc_props = f' bitrate={args.bitrate}'
         if args.encoder_props:
             enc_props = (enc_props + ' ' + args.encoder_props).strip()
         video_enc = f'{args.h264_encoder}{(" " + enc_props) if enc_props else ""}'
-        video_pay = (
-            'h264parse config-interval=1 ! '
-            'capsfilter caps=video/x-h264,stream-format=avc,alignment=au ! '
-            f'rtph264pay pt=97 config-interval=1{rtp_mtu_prop}'
-        )
-        video_rtp_caps = (
-            'capsfilter caps=application/x-rtp,media=video,encoding-name=H264,payload=97,clock-rate=90000,'
-            'packetization-mode=1'
-        )
+        if is_v4l2:
+            video_pay = (
+                'h264parse config-interval=-1 ! '
+                'capsfilter caps=video/x-h264,stream-format=byte-stream,alignment=au ! '
+                f'rtph264pay pt=97 config-interval=-1{rtp_mtu_prop}'
+            )
+        else:
+            # Force constrained-baseline profile for WebRTC browser compatibility
+            video_pay = (
+                'video/x-h264,profile=constrained-baseline ! '
+                'h264parse config-interval=-1 ! '
+                f'rtph264pay pt=97 config-interval=-1 aggregate-mode=zero-latency{rtp_mtu_prop}'
+            )
+        video_rtp_caps = ''
     else:
         raise ValueError(f"Unknown video codec: {args.video_codec}")
 
     src_caps_part = f' ! capsfilter caps={video_caps}' if video_caps else ''
     format_caps_part = ''
-    if args.video_codec == 'h264':
-        format_caps_part = ' ! capsfilter caps=video/x-raw,format=NV12'
-    elif args.video_codec == 'vp8':
-        format_caps_part = ' ! capsfilter caps=video/x-raw,format=I420'
+    if args.video_source == 'test':
+        if args.video_codec == 'h264':
+            if args.h264_encoder.startswith('v4l2h264enc'):
+                format_caps_part = ' ! capsfilter caps=video/x-raw,format=NV12'
+            else:
+                format_caps_part = ' ! capsfilter caps=video/x-raw,format=I420'
+        elif args.video_codec == 'vp8':
+            format_caps_part = ' ! capsfilter caps=video/x-raw,format=I420'
     preview_chain = ''
     if args.preview:
-        preview_chain = f'vtee. ! queue ! autovideosink sync=false\n '
+        preview_chain = f'vtee. ! queue ! videoconvert ! autovideosink sync=false\n '
 
+    if args.video_source == 'libcamera':
+        if args.video_codec == 'h264' and not args.h264_encoder.startswith('v4l2h264enc'):
+            fmt_caps = 'video/x-raw,format=I420'
+        else:
+            fmt_caps = 'video/x-raw,format=NV12'
+        video_pre = (
+            f'{video_src}{src_caps_part} ! queue ! videoconvert '
+            f'! capsfilter caps={fmt_caps} '
+        )
+    else:
+        video_pre = f'{video_src}{src_caps_part} ! videoconvert{format_caps_part} '
+
+    rtp_caps_part = f' ! {video_rtp_caps}' if video_rtp_caps else ''
     video_chain = (
-        f'{video_src}{src_caps_part} ! videoconvert{format_caps_part} ! tee name=vtee '\
-        f'vtee. ! {video_queue} ! {video_enc} ! {video_pay} ! {video_queue} ! {video_rtp_caps} ! sendrecv.\n '
+        f'{video_pre}! tee name=vtee '
+        f'vtee. ! {video_queue} ! {video_enc} ! {video_pay} ! {rtp_queue}{rtp_caps_part} ! sendrecv.\n '
         f'{preview_chain}'
     )
 
@@ -326,7 +371,7 @@ def build_pipeline(args):
     else:
         audio_chain = (
             'audiotestsrc is-live=true wave=red-noise ! audioconvert ! audioresample ! '
-            f'{audio_queue} ! opusenc ! rtpopuspay ! {audio_queue} ! '
+            f'{audio_queue} ! opusenc ! rtpopuspay ! {rtp_queue} ! '
             'application/x-rtp,media=audio,encoding-name=OPUS,payload=96 ! sendrecv.'
         )
 
@@ -339,10 +384,24 @@ def build_pipeline(args):
     return pipeline
 
 
-def check_plugins():
-    needed = ["opus", "vpx", "nice", "webrtc", "dtls", "srtp", "rtp",
-              "rtpmanager", "videotestsrc", "audiotestsrc"]
-    missing = list(filter(lambda p: Gst.Registry.get().find_plugin(p) is None, needed))
+def check_plugins(args):
+    needed = [
+        "webrtcbin",
+        "audiotestsrc",
+        "opusenc",
+        "rtpopuspay",
+    ]
+    if args.video_source == 'test':
+        needed.append("videotestsrc")
+    elif args.video_source == 'libcamera':
+        needed.append("libcamerasrc")
+
+    if args.video_codec == 'vp8':
+        needed.extend(["vp8enc", "rtpvp8pay"])
+    elif args.video_codec == 'h264':
+        needed.extend([args.h264_encoder, "h264parse", "rtph264pay"])
+
+    missing = [name for name in needed if Gst.ElementFactory.find(name) is None]
     if len(missing):
         print('Missing gstreamer plugins:', missing)
         return False
@@ -351,16 +410,14 @@ def check_plugins():
 
 if __name__=='__main__':
     Gst.init(None)
-    if not check_plugins():
-        sys.exit(1)
     parser = argparse.ArgumentParser()
     parser.add_argument('peerid', nargs='?', default='browser',
                         help='String ID of the peer to connect to (default: browser)')
     parser.add_argument('--server', help='Signalling server to connect to, eg "wss://127.0.0.1:8443"')
     parser.add_argument('--video-source', choices=['test', 'libcamera'], default='test',
                         help='Video source to use (default: test)')
-    parser.add_argument('--video-codec', choices=['vp8', 'h264'], default='vp8',
-                        help='Video codec to use (default: vp8)')
+    parser.add_argument('--video-codec', choices=['vp8', 'h264'], default='h264',
+                        help='Video codec to use (default: h264)')
     parser.add_argument('--h264-encoder', default='v4l2h264enc',
                         help='H.264 encoder element (default: v4l2h264enc)')
     parser.add_argument('--encoder-props', default='',
@@ -370,12 +427,14 @@ if __name__=='__main__':
     parser.add_argument('--framerate', type=int, default=0, help='Video framerate (libcamera only)')
     parser.add_argument('--bitrate', type=int, default=0, help='Encoder bitrate (kbps, if supported)')
     parser.add_argument('--keyframe-interval', '--key-int', dest='keyframe_interval', type=int, default=30,
-                        help='Keyframe interval for VP8 (default: 30)')
+                        help='Keyframe interval for VP8 only (default: 30)')
     parser.add_argument('--rtp-mtu', type=int, default=0,
                         help='RTP MTU size (optional)')
     parser.add_argument('--no-audio', action='store_true', help='Disable audio')
     parser.add_argument('--preview', action='store_true', help='Show local preview on Pi')
     args = parser.parse_args()
+    if not check_plugins(args):
+        sys.exit(1)
     try:
         PIPELINE_DESC = build_pipeline(args)
     except ValueError as exc:

@@ -109,6 +109,13 @@ function onIncomingSDP(sdp) {
 // Local description was set, send it to peer
 function onLocalDescription(desc) {
     console.log("Got local description: " + JSON.stringify(desc));
+    // Log relevant SDP lines for debugging
+    if (desc.sdp) {
+        desc.sdp.split('\r\n').forEach(line => {
+            if (line.match(/^(m=|a=fmtp|a=rtpmap)/))
+                console.log('SDP answer line:', line);
+        });
+    }
     peer_connection.setLocalDescription(desc).then(function() {
         setStatus("Sending SDP " + desc.type);
         sdp = {'sdp': peer_connection.localDescription}
@@ -229,10 +236,8 @@ function getLocalStream() {
 
 function websocketServerConnect() {
     connect_attempts++;
-    if (connect_attempts > 3) {
-        setError("Too many connection attempts, aborting. Refresh page to try again");
-        return;
-    }
+    // Keep retrying indefinitely
+    console.log("Connection attempt " + connect_attempts);
     // Clear errors in the status span
     var span = document.getElementById("status");
     span.classList.remove('error');
@@ -280,10 +285,61 @@ function onRemoteTrack(event) {
         videoElement.srcObject = event.streams[0];
         videoElement.muted = true;
         videoElement.onloadedmetadata = () => {
-            console.log('Video metadata:', videoElement.videoWidth, videoElement.videoHeight);
-            videoElement.play().catch(() => {});
+            console.log('Video metadata loaded:', videoElement.videoWidth, 'x', videoElement.videoHeight);
+            videoElement.play().catch(e => console.error('play() failed:', e));
         };
-        videoElement.play().catch(() => {});
+        videoElement.play().catch(e => console.error('play() failed:', e));
+
+        // Periodic stats monitoring — updates on-page panel when checkbox is checked
+        if (stats_interval) clearInterval(stats_interval);
+        var prevStats = { bytes: 0, pkts: 0, frames: 0, ts: 0 };
+        stats_interval = setInterval(async () => {
+            if (!peer_connection) return;
+            var toggle = document.getElementById('stats-toggle');
+            var panel = document.getElementById('stats-panel');
+            if (!toggle || !toggle.checked) {
+                if (panel) panel.style.display = 'none';
+                return;
+            }
+            if (panel) panel.style.display = 'block';
+            try {
+                const stats = await peer_connection.getStats();
+                stats.forEach(report => {
+                    if (report.type === 'inbound-rtp' && report.kind === 'video') {
+                        var now = report.timestamp;
+                        var dt = prevStats.ts ? (now - prevStats.ts) / 1000 : 0;
+                        var bitrate = dt > 0 ? ((report.bytesReceived - prevStats.bytes) * 8 / dt / 1000).toFixed(0) : '—';
+                        var fps = dt > 0 ? ((report.framesDecoded - prevStats.frames) / dt).toFixed(1) : '—';
+                        var pps = dt > 0 ? ((report.packetsReceived - prevStats.pkts) / dt).toFixed(0) : '—';
+                        prevStats = { bytes: report.bytesReceived, pkts: report.packetsReceived, frames: report.framesDecoded, ts: now };
+
+                        var lostClass = report.packetsLost < 10 ? 'good' : report.packetsLost < 100 ? 'warn' : 'bad';
+                        var jitterClass = report.jitter < 0.02 ? 'good' : report.jitter < 0.05 ? 'warn' : 'bad';
+                        var fpsNum = parseFloat(fps);
+                        var fpsClass = isNaN(fpsNum) ? '' : fpsNum > 8 ? 'good' : fpsNum > 3 ? 'warn' : 'bad';
+
+                        function row(label, value, cls) {
+                            return '<div class="stat-row"><span class="stat-label">' + label +
+                                   '</span><span class="stat-value ' + (cls||'') + '">' + value + '</span></div>';
+                        }
+                        if (panel) {
+                            panel.innerHTML =
+                                '<div class="stat-heading">Video RTP Statistics</div>' +
+                                row('Bitrate', bitrate + ' kbps') +
+                                row('FPS', fps, fpsClass) +
+                                row('Packets/s', pps) +
+                                row('Total Packets', report.packetsReceived.toLocaleString()) +
+                                row('Packets Lost', report.packetsLost.toLocaleString(), lostClass) +
+                                row('Frames Decoded', report.framesDecoded.toLocaleString()) +
+                                row('Frames Dropped', (report.framesDropped || 0).toLocaleString()) +
+                                row('Key Frames', (report.keyFramesDecoded || 0).toLocaleString()) +
+                                row('Jitter', (report.jitter * 1000).toFixed(1) + ' ms', jitterClass) +
+                                row('Decoder', report.decoderImplementation || 'unknown');
+                        }
+                    }
+                });
+            } catch(e) {}
+        }, 2000);
     }
 }
 

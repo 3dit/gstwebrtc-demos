@@ -14,6 +14,40 @@
     <meta charset="utf-8"/>
     <style>
       .error { color: red; }
+      #stats-panel {
+        display: none;
+        margin-top: 6px;
+        padding: 8px 12px;
+        background: #f4f4f4;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        font: 11px/1.6 monospace;
+        color: #444;
+        max-width: 480px;
+      }
+      #stats-panel .stat-row {
+        display: flex;
+        justify-content: space-between;
+        padding: 1px 0;
+      }
+      #stats-panel .stat-label {
+        color: #888;
+      }
+      #stats-panel .stat-value {
+        font-weight: bold;
+        color: #222;
+      }
+      #stats-panel .stat-value.good  { color: #2a7; }
+      #stats-panel .stat-value.warn  { color: #c80; }
+      #stats-panel .stat-value.bad   { color: #c33; }
+      #stats-panel .stat-heading {
+        font-weight: bold;
+        font-size: 11px;
+        color: #666;
+        border-bottom: 1px solid #ddd;
+        margin-bottom: 3px;
+        padding-bottom: 2px;
+      }
     </style>
     <script src="https://webrtc.github.io/adapter/adapter-latest.js"></script>
     <script src="webrtc.js"></script>
@@ -25,6 +59,8 @@
   <body>
     <div><video id="stream" autoplay playsinline width="480" height="360" style="background: #000">Your browser doesn't support video</video></div>
     <div>Status: <span id="status">unknown</span></div>
+    <div><label style="font-size:12px;color:#666"><input type="checkbox" id="stats-toggle"> Show RTP stats</label></div>
+    <div id="stats-panel"></div>
     <div><textarea id="text" cols=40 rows=4></textarea></div>
     <div>Our id is <b id="peer-id">unknown</b></div>
     <br/>
