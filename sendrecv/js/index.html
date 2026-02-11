@@ -57,7 +57,8 @@
   </head>
 
   <body>
-    <div><video id="stream" autoplay playsinline width="480" height="360" style="background: #000">Your browser doesn't support video</video></div>
+    <div><video id="stream" autoplay playsinline width="640" height="480" style="background: #000">Your browser doesn't support video</video></div>
+    <div><button id="unmute-btn" onclick="var v=document.getElementById('stream'); v.muted=false; this.textContent='🔊 Audio ON'; this.style.background='#2a7'; this.style.color='#fff';" style="font-size:14px;padding:4px 12px;cursor:pointer;">🔇 Click to unmute audio</button></div>
     <div>Status: <span id="status">unknown</span></div>
     <div><label style="font-size:12px;color:#666"><input type="checkbox" id="stats-toggle"> Show RTP stats</label></div>
     <div id="stats-panel"></div>

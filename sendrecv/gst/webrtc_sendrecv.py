@@ -1,5 +1,7 @@
 import random
 import ssl
+import time
+import threading
 import websockets
 import asyncio
 import os
@@ -95,6 +97,18 @@ class WebRTCClient:
     def on_ice_state_changed(self, element, _):
         state = element.get_property('ice-connection-state')
         print('ICE connection state:', state.value_nick)
+        if state.value_nick == 'failed':
+            print('ICE failed — will close and retry...')
+            # Close the websocket from a separate thread so the async
+            # message loop sees ConnectionClosed and triggers a clean
+            # reconnect cycle.
+            if self.conn:
+                close_loop = asyncio.new_event_loop()
+                try:
+                    close_loop.run_until_complete(self.conn.close())
+                except Exception:
+                    pass
+                close_loop.close()
 
     def on_connection_state_changed(self, element, _):
         state = element.get_property('connection-state')
@@ -106,10 +120,33 @@ class WebRTCClient:
             print('DTLS connected — forcing keyframe...')
             event = GstVideo.video_event_new_upstream_force_key_unit(
                 Gst.CLOCK_TIME_NONE, True, 0)
-            if self.pipe.send_event(event):
-                print('Force-key-unit event sent successfully')
-            else:
-                print('Warning: Force-key-unit event failed')
+            # Force-key-unit is an upstream event.  Sending it on the pipeline
+            # routes it to sinks (downstream), which doesn't reach the encoder.
+            # Instead, find the encoder's sink pad and push it there so it
+            # travels upstream through the pipeline to the video encoder.
+            sent = False
+            for factory_name in ('x264enc', 'v4l2h264enc', 'vp8enc'):
+                it = self.pipe.iterate_elements()
+                while True:
+                    ret, elem = it.next()
+                    if ret != Gst.IteratorResult.OK:
+                        break
+                    f = elem.get_factory()
+                    if f and f.get_name() == factory_name:
+                        # send_event on the element itself routes upstream
+                        # events correctly through the element.
+                        if elem.send_event(event):
+                            print(f'Force-key-unit sent to {elem.get_name()}')
+                            sent = True
+                            break
+                if sent:
+                    break
+            if not sent:
+                # Fallback: send on pipeline (may not work but worth trying)
+                if self.pipe.send_event(event):
+                    print('Force-key-unit event sent via pipeline')
+                else:
+                    print('Warning: Force-key-unit event failed')
 
     def on_signaling_state_changed(self, element, _):
         state = element.get_property('signaling-state')
@@ -125,6 +162,37 @@ class WebRTCClient:
             except Exception as e:
                 print(f'Warning: could not set rtcp-sync-send-time: {e}')
 
+    # ---- RTP flow diagnostics ----
+    rtp_video_buffers = 0
+    rtp_video_bytes = 0
+    rtp_audio_buffers = 0
+    _stats_timer = None
+
+    @staticmethod
+    def _video_probe_cb(pad, info, self_ref):
+        buf = info.get_buffer()
+        if buf:
+            self_ref.rtp_video_buffers += 1
+            self_ref.rtp_video_bytes += buf.get_size()
+        return Gst.PadProbeReturn.OK
+
+    @staticmethod
+    def _audio_probe_cb(pad, info, self_ref):
+        buf = info.get_buffer()
+        if buf:
+            self_ref.rtp_audio_buffers += 1
+        return Gst.PadProbeReturn.OK
+
+    def _print_rtp_stats(self):
+        if self.pipe is None:
+            return
+        print(f'[RTP stats] video: {self.rtp_video_buffers} pkts '
+              f'({self.rtp_video_bytes} bytes) | '
+              f'audio: {self.rtp_audio_buffers} pkts')
+        self._stats_timer = threading.Timer(5.0, self._print_rtp_stats)
+        self._stats_timer.daemon = True
+        self._stats_timer.start()
+
     def on_bus_error(self, _, msg):
         err, debug = msg.parse_error()
         print('GStreamer error:', err, debug)
@@ -134,6 +202,12 @@ class WebRTCClient:
         print('GStreamer warning:', err, debug)
 
     def send_ice_candidate_message(self, _, mlineindex, candidate):
+        # Filter out empty candidate (end-of-candidates signal).
+        # Sending it prematurely causes the browser to stop waiting for
+        # STUN srflx candidates, which leads to ICE failure on reconnect.
+        if not candidate:
+            print('Suppressing empty end-of-candidates signal')
+            return
         print('Sending ICE candidate', mlineindex, candidate)
         icemsg = json.dumps({'ice': {'candidate': candidate, 'sdpMLineIndex': mlineindex}})
         loop = asyncio.new_event_loop()
@@ -207,20 +281,55 @@ class WebRTCClient:
         try:
             trans = self.webrtc.emit('get-transceiver', 0)
             if trans:
+                # Do NOT include profile-level-id here — it forces x264enc to
+                # negotiate that level, which fails when the resolution exceeds
+                # what the level allows (e.g. level 2.1 caps at 352×288).
+                # Let x264enc pick the correct level for the actual resolution.
                 caps = Gst.caps_from_string(
                     'application/x-rtp,media=video,encoding-name=H264,payload=97,'
                     'clock-rate=90000,packetization-mode=(string)1,'
-                    'profile-level-id=(string)42c015,level-asymmetry-allowed=(string)1'
+                    'level-asymmetry-allowed=(string)1'
                 )
                 trans.set_property('codec-preferences', caps)
-                print('Set H264 codec-preferences (constrained-baseline, packetization-mode=1)')
+                print('Set H264 codec-preferences (packetization-mode=1, no fixed level)')
         except Exception as e:
-            print(f'Warning: could not set codec-preferences: {e}')
+            print(f'Warning: could not set video codec-preferences: {e}')
+        # Set codec preferences on the audio transceiver so the OPUS SDP
+        # stays correct across pipeline rebuilds (channels, fmtp, etc.).
+        try:
+            trans = self.webrtc.emit('get-transceiver', 1)
+            if trans:
+                caps = Gst.caps_from_string(
+                    'application/x-rtp,media=audio,encoding-name=OPUS,payload=96,'
+                    'clock-rate=48000,encoding-params=(string)2'
+                )
+                trans.set_property('codec-preferences', caps)
+                print('Set OPUS codec-preferences on audio transceiver')
+        except Exception as e:
+            print(f'Warning: could not set audio codec-preferences: {e}')
         bus = self.pipe.get_bus()
         bus.add_signal_watch()
         bus.connect('message::error', self.on_bus_error)
         bus.connect('message::warning', self.on_bus_warning)
         self.pipe.set_state(Gst.State.PLAYING)
+        # Install pad probes to count RTP buffers entering webrtcbin
+        self.rtp_video_buffers = 0
+        self.rtp_video_bytes = 0
+        self.rtp_audio_buffers = 0
+        vpad = self.webrtc.get_static_pad('sink_0')
+        if vpad:
+            vpad.add_probe(Gst.PadProbeType.BUFFER, self._video_probe_cb, self)
+            print(f'Installed video RTP probe on {vpad.get_name()}')
+        else:
+            print('Warning: could not find sink_0 on webrtcbin')
+        apad = self.webrtc.get_static_pad('sink_1')
+        if apad:
+            apad.add_probe(Gst.PadProbeType.BUFFER, self._audio_probe_cb, self)
+            print(f'Installed audio RTP probe on {apad.get_name()}')
+        else:
+            print('Warning: could not find sink_1 on webrtcbin')
+        # Periodic stats
+        self._print_rtp_stats()
         self.on_negotiation_needed(self.webrtc)
 
     def handle_sdp(self, message):
@@ -245,24 +354,42 @@ class WebRTCClient:
             self.webrtc.emit('add-ice-candidate', sdpmlineindex, candidate)
 
     def close_pipeline(self):
+        if self._stats_timer:
+            self._stats_timer.cancel()
+            self._stats_timer = None
         if self.pipe:
+            bus = self.pipe.get_bus()
+            if bus:
+                bus.remove_signal_watch()
             self.pipe.set_state(Gst.State.NULL)
         self.pipe = None
         self.webrtc = None
+        self.negotiation_started = False
+        # Help GC release GStreamer element references so the next
+        # pipeline rebuild starts with a clean slate.
+        import gc
+        gc.collect()
 
     async def loop(self):
+        """Run the signalling message loop.  Returns 0 on clean
+        disconnect (e.g. browser reload), 1 on fatal error."""
         assert self.conn
-        async for message in self.conn:
-            if message == 'HELLO':
-                await self.setup_call()
-            elif message == 'SESSION_OK':
-                self.start_pipeline()
-            elif message.startswith('ERROR'):
-                print (message)
-                self.close_pipeline()
-                return 1
-            else:
-                self.handle_sdp(message)
+        try:
+            async for message in self.conn:
+                if message == 'HELLO':
+                    await self.setup_call()
+                elif message == 'SESSION_OK':
+                    self.start_pipeline()
+                elif message.startswith('ERROR'):
+                    print(message)
+                    self.close_pipeline()
+                    return 1
+                else:
+                    self.handle_sdp(message)
+        except websockets.ConnectionClosed:
+            print('Websocket connection closed by server')
+        except Exception as e:
+            print(f'Unexpected error in message loop: {e}')
         self.close_pipeline()
         return 0
 
@@ -292,6 +419,18 @@ def build_pipeline(args):
             )
         else:
             video_caps = 'video/x-raw,format=NV12'
+    elif args.video_source == 'v4l2':
+        # io-mode=mmap avoids DMABuf caps that videoconvert can't handle
+        video_src = f'v4l2src device={args.v4l2_device} io-mode=mmap'
+        caps_parts = []
+        if args.width and args.height:
+            caps_parts.append(f'width={args.width},height={args.height}')
+        if args.framerate:
+            caps_parts.append(f'framerate={args.framerate}/1')
+        if caps_parts:
+            video_caps = 'video/x-raw,' + ','.join(caps_parts)
+        else:
+            video_caps = ''
     else:
         raise ValueError(f"Unknown video source: {args.video_source}")
 
@@ -356,6 +495,11 @@ def build_pipeline(args):
             f'{video_src}{src_caps_part} ! queue ! videoconvert '
             f'! capsfilter caps={fmt_caps} '
         )
+    elif args.video_source == 'v4l2':
+        video_pre = (
+            f'{video_src}{src_caps_part} ! queue ! videoconvert '
+            f'! capsfilter caps=video/x-raw,format=I420 '
+        )
     else:
         video_pre = f'{video_src}{src_caps_part} ! videoconvert{format_caps_part} '
 
@@ -369,8 +513,12 @@ def build_pipeline(args):
     if args.no_audio:
         audio_chain = ''
     else:
+        if args.audio_source == 'alsa':
+            audio_src = f'alsasrc device={args.alsa_device} ! audio/x-raw,format=S16LE,channels=1,rate=48000'
+        else:
+            audio_src = 'audiotestsrc is-live=true wave=red-noise'
         audio_chain = (
-            'audiotestsrc is-live=true wave=red-noise ! audioconvert ! audioresample ! '
+            f'{audio_src} ! audioconvert ! audioresample ! '
             f'{audio_queue} ! opusenc ! rtpopuspay ! {rtp_queue} ! '
             'application/x-rtp,media=audio,encoding-name=OPUS,payload=96 ! sendrecv.'
         )
@@ -387,14 +535,20 @@ def build_pipeline(args):
 def check_plugins(args):
     needed = [
         "webrtcbin",
-        "audiotestsrc",
         "opusenc",
         "rtpopuspay",
     ]
+    if not args.no_audio:
+        if args.audio_source == 'alsa':
+            needed.append("alsasrc")
+        else:
+            needed.append("audiotestsrc")
     if args.video_source == 'test':
         needed.append("videotestsrc")
     elif args.video_source == 'libcamera':
         needed.append("libcamerasrc")
+    elif args.video_source == 'v4l2':
+        needed.append("v4l2src")
 
     if args.video_codec == 'vp8':
         needed.extend(["vp8enc", "rtpvp8pay"])
@@ -414,22 +568,28 @@ if __name__=='__main__':
     parser.add_argument('peerid', nargs='?', default='browser',
                         help='String ID of the peer to connect to (default: browser)')
     parser.add_argument('--server', help='Signalling server to connect to, eg "wss://127.0.0.1:8443"')
-    parser.add_argument('--video-source', choices=['test', 'libcamera'], default='test',
+    parser.add_argument('--video-source', choices=['test', 'libcamera', 'v4l2'], default='test',
                         help='Video source to use (default: test)')
+    parser.add_argument('--v4l2-device', default='/dev/video0',
+                        help='V4L2 device path for USB webcam (default: /dev/video0)')
     parser.add_argument('--video-codec', choices=['vp8', 'h264'], default='h264',
                         help='Video codec to use (default: h264)')
     parser.add_argument('--h264-encoder', default='v4l2h264enc',
                         help='H.264 encoder element (default: v4l2h264enc)')
     parser.add_argument('--encoder-props', default='',
                         help='Additional encoder properties, e.g. "extra-controls=\"controls,video_bitrate=2000000\""')
-    parser.add_argument('--width', type=int, default=0, help='Video width (libcamera only)')
-    parser.add_argument('--height', type=int, default=0, help='Video height (libcamera only)')
-    parser.add_argument('--framerate', type=int, default=0, help='Video framerate (libcamera only)')
+    parser.add_argument('--width', type=int, default=0, help='Video width')
+    parser.add_argument('--height', type=int, default=0, help='Video height')
+    parser.add_argument('--framerate', type=int, default=0, help='Video framerate')
     parser.add_argument('--bitrate', type=int, default=0, help='Encoder bitrate (kbps, if supported)')
     parser.add_argument('--keyframe-interval', '--key-int', dest='keyframe_interval', type=int, default=30,
                         help='Keyframe interval for VP8 only (default: 30)')
     parser.add_argument('--rtp-mtu', type=int, default=0,
                         help='RTP MTU size (optional)')
+    parser.add_argument('--audio-source', choices=['test', 'alsa'], default='test',
+                        help='Audio source: test tone or ALSA mic (default: test)')
+    parser.add_argument('--alsa-device', default='hw:3,0',
+                        help='ALSA capture device for mic input (default: hw:3,0)')
     parser.add_argument('--no-audio', action='store_true', help='Disable audio')
     parser.add_argument('--preview', action='store_true', help='Show local preview on Pi')
     args = parser.parse_args()
@@ -440,9 +600,18 @@ if __name__=='__main__':
     except ValueError as exc:
         print(exc)
         sys.exit(1)
-    our_id = random.randrange(10, 10000)
-    c = WebRTCClient(our_id, args.peerid, args.server)
     loop = asyncio.get_event_loop()
-    loop.run_until_complete(c.connect())
-    res = loop.run_until_complete(c.loop())
-    sys.exit(res)
+    while True:
+        our_id = random.randrange(10, 10000)
+        c = WebRTCClient(our_id, args.peerid, args.server)
+        try:
+            loop.run_until_complete(c.connect())
+            res = loop.run_until_complete(c.loop())
+        except Exception as e:
+            print(f'Connection error: {e}')
+            res = 0
+        if res != 0:
+            sys.exit(res)
+        print('Peer disconnected — waiting 2s before reconnecting...')
+
+        time.sleep(2)

@@ -13,10 +13,36 @@ var ws_port;
 // Set this to use a specific peer id instead of a random one
 var default_peer_id = 'browser';
 // Override with your own STUN servers if you want
-var rtc_configuration = {iceServers: [{urls: "stun:stun.services.mozilla.com"},
-                                      {urls: "stun:stun.l.google.com:19302"}]};
+var rtc_configuration = {
+    iceServers: [{urls: "stun:stun.l.google.com:19302"}],
+};
 // The default constraints that will be attempted. Can be overriden by the user.
 var default_constraints = {video: false, audio: false};
+// Detected local LAN IP (used to fix mDNS .local ICE candidates)
+var local_ip = null;
+
+// Discover our real LAN IP by creating a temporary RTCPeerConnection
+// and looking at the host candidates it gathers.
+function discoverLocalIP() {
+    return new Promise((resolve) => {
+        var pc = new RTCPeerConnection({iceServers: []});
+        pc.createDataChannel('');
+        var found = false;
+        pc.onicecandidate = (e) => {
+            if (!e.candidate) { pc.close(); if (!found) resolve(null); return; }
+            var m = e.candidate.candidate.match(/candidate:\S+ \d+ udp \d+ (\d+\.\d+\.\d+\.\d+) /);
+            if (m && !m[1].startsWith('0.') && !m[1].startsWith('127.')) {
+                found = true;
+                console.log('Discovered local IP:', m[1]);
+                pc.close();
+                resolve(m[1]);
+            }
+        };
+        pc.createOffer().then(o => pc.setLocalDescription(o));
+        // Timeout after 3 seconds
+        setTimeout(() => { if (!found) { pc.close(); resolve(null); } }, 3000);
+    });
+}
 
 var connect_attempts = 0;
 var peer_connection;
@@ -137,6 +163,19 @@ function onIncomingICE(ice) {
     peer_connection.addIceCandidate(candidate).catch(setError);
 }
 
+// Rewrite .local mDNS addresses in an outgoing ICE candidate to the real
+// local IP.  GStreamer's libnice cannot resolve Chrome's ephemeral mDNS
+// names, which causes ICE failure (especially on reconnect when Chrome's
+// STUN srflx candidates are delayed).
+function fixLocalCandidate(candidateStr) {
+    if (!local_ip) return candidateStr;
+    // Match UUID.local addresses Chrome generates
+    return candidateStr.replace(
+        /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.local/g,
+        local_ip
+    );
+}
+
 function onServerMessage(event) {
     console.log("Received " + event.data);
     switch (event.data) {
@@ -234,7 +273,7 @@ function getLocalStream() {
     return Promise.resolve(null);
 }
 
-function websocketServerConnect() {
+async function websocketServerConnect() {
     connect_attempts++;
     // Keep retrying indefinitely
     console.log("Connection attempt " + connect_attempts);
@@ -242,6 +281,11 @@ function websocketServerConnect() {
     var span = document.getElementById("status");
     span.classList.remove('error');
     span.textContent = '';
+    // Discover our real LAN IP (for rewriting mDNS candidates)
+    if (!local_ip) {
+        try { local_ip = await discoverLocalIP(); } catch(e) {}
+        console.log('Local IP for ICE fix:', local_ip);
+    }
     // Populate constraints
     var textarea = document.getElementById('constraints');
     if (textarea.value == '')
@@ -272,18 +316,20 @@ function websocketServerConnect() {
 }
 
 function onRemoteTrack(event) {
-    if (event.track && event.track.kind !== 'video') {
+    if (!event.streams || !event.streams[0]) {
+        console.log('onRemoteTrack: no stream, ignoring');
         return;
     }
-    if (getVideoElement().srcObject !== event.streams[0]) {
+    console.log('onRemoteTrack:', event.track.kind, 'readyState:', event.track.readyState);
+    event.track.onmute = () => console.log('Track muted:', event.track.kind);
+    event.track.onunmute = () => console.log('Track unmuted:', event.track.kind);
+    const videoElement = getVideoElement();
+    if (videoElement.srcObject !== event.streams[0]) {
         console.log('Incoming stream');
-        console.log('Track kind:', event.track.kind, 'readyState:', event.track.readyState);
         console.log('Stream tracks:', event.streams[0].getTracks().map(t => t.kind + ':' + t.readyState));
-        event.track.onmute = () => console.log('Track muted:', event.track.kind);
-        event.track.onunmute = () => console.log('Track unmuted:', event.track.kind);
-        const videoElement = getVideoElement();
         videoElement.srcObject = event.streams[0];
-        videoElement.muted = true;
+        // Do NOT set muted=true — that silences audio.
+        // autoplay + playsinline on the element handle autoplay policy.
         videoElement.onloadedmetadata = () => {
             console.log('Video metadata loaded:', videoElement.videoWidth, 'x', videoElement.videoHeight);
             videoElement.play().catch(e => console.error('play() failed:', e));
@@ -432,7 +478,16 @@ function createCall(msg) {
             console.log("ICE Candidate was null, done");
             return;
 	}
-	ws_conn.send(JSON.stringify({'ice': event.candidate}));
+	// Rewrite mDNS .local addresses to real IPs so GStreamer can use them
+	var ice = event.candidate.toJSON();
+	if (ice.candidate && ice.candidate.includes('.local')) {
+	    var original = ice.candidate;
+	    ice.candidate = fixLocalCandidate(ice.candidate);
+	    if (ice.candidate !== original) {
+	        console.log('Rewrote mDNS candidate:', original, '->', ice.candidate);
+	    }
+	}
+	ws_conn.send(JSON.stringify({'ice': ice}));
     };
 
     if (msg != null)
