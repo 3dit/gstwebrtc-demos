@@ -422,15 +422,22 @@ def build_pipeline(args):
     elif args.video_source == 'v4l2':
         # io-mode=mmap avoids DMABuf caps that videoconvert can't handle
         video_src = f'v4l2src device={args.v4l2_device} io-mode=mmap'
-        caps_parts = []
+        # Capture at native resolution, then use videorate to downsample fps
+        # (many USB cameras only output 30fps regardless of caps request)
+        src_caps_parts = []
         if args.width and args.height:
-            caps_parts.append(f'width={args.width},height={args.height}')
-        if args.framerate:
-            caps_parts.append(f'framerate={args.framerate}/1')
-        if caps_parts:
-            video_caps = 'video/x-raw,' + ','.join(caps_parts)
+            src_caps_parts.append(f'width={args.width},height={args.height}')
+        if src_caps_parts:
+            video_caps_str = 'video/x-raw,' + ','.join(src_caps_parts)
         else:
-            video_caps = ''
+            video_caps_str = 'video/x-raw'
+        if args.framerate:
+            video_caps = (
+                f'{video_caps_str} ! videorate ! '
+                f'video/x-raw,framerate={args.framerate}/1'
+            )
+        else:
+            video_caps = video_caps_str
     else:
         raise ValueError(f"Unknown video source: {args.video_source}")
 
@@ -514,7 +521,7 @@ def build_pipeline(args):
         audio_chain = ''
     else:
         if args.audio_source == 'alsa':
-            audio_src = f'alsasrc device={args.alsa_device} ! audio/x-raw,format=S16LE,channels=1,rate=48000'
+            audio_src = f'alsasrc device={args.alsa_device}'
         else:
             audio_src = 'audiotestsrc is-live=true wave=red-noise'
         audio_chain = (
